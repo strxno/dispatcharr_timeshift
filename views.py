@@ -169,43 +169,19 @@ def timeshift_proxy(request, username, password, stream_id, timestamp, duration)
         logger.error(f"[Timeshift] Access denied: user {username} (level {user.user_level}) < channel {channel.name} (level {channel.user_level})")
         return HttpResponseForbidden("Access denied")
 
-    # Step 4: Check if stream supports catch-up, or find fallback
-    catchup_stream = stream
+    # Step 4: Verify channel supports timeshift
     props = stream.custom_properties or {}
-
     if props.get('tv_archive') not in (1, '1'):
-        # Requested stream lacks catch-up, search for fallback
-        if debug:
-            logger.info(f"[Timeshift] {stream.name} has no catch-up, finding fallback in {channel.name}...")
-
-        catchup_stream = None
-
-        # ✅ NEW: Fallback chain search through all streams
-        for alt_stream in channel.streams.order_by('channelstream__order'):
-            alt_props = alt_stream.custom_properties or {}
-            if alt_props.get('tv_archive') in (1, '1'):
-                catchup_stream = alt_stream
-                props = alt_props
-
-                if debug:
-                    logger.info(f"[Timeshift] ✅ Catch-up fallback found: {alt_stream.name} (Provider: {alt_stream.m3u_account.name})")
-                break
-
-        if not catchup_stream:
-            logger.error(f"[Timeshift] No catch-up stream available in channel {channel.name}")
-            return HttpResponseBadRequest("Timeshift not supported for this channel")
-
-    if debug:
-        logger.info(f"[Timeshift] Using stream: {catchup_stream.name}")
-
-    # Step 5: Verify it's an Xtream Codes provider
-    m3u_account = catchup_stream.m3u_account
-    if not m3u_account or m3u_account.account_type != 'XC':
-        logger.error(f"[Timeshift] Selected stream {catchup_stream.name} is not from XC provider")
-        return HttpResponseBadRequest("Channel not from Xtream Codes provider")
+        logger.error(f"[Timeshift] Channel {channel.name} does not support timeshift (tv_archive={props.get('tv_archive')})")
+        return HttpResponseBadRequest("Timeshift not supported for this channel")
 
     if debug:
         logger.info(f"[Timeshift] Stream props: {props}")
+
+    # Step 5: Verify it's an Xtream Codes provider
+    m3u_account = stream.m3u_account
+    if not m3u_account or m3u_account.account_type != 'XC':
+        return HttpResponseBadRequest("Channel not from Xtream Codes provider")
 
     # Step 6: Convert timestamp from UTC to provider's local timezone
     local_timestamp = _convert_timestamp_to_local(timestamp, timezone_str)
@@ -223,14 +199,28 @@ def timeshift_proxy(request, username, password, stream_id, timestamp, duration)
     fallback_url = None
 
     if url_format == 'custom' and custom_template:
-        # Custom template
+        # Custom template - provide all available variables
+        try:
+            # Parse local timestamp to Unix epoch for providers that use it
+            local_dt = datetime.strptime(local_timestamp, "%Y-%m-%d:%H-%M")
+            local_dt = local_dt.replace(tzinfo=ZoneInfo(timezone_str))
+            start_unix = int(local_dt.timestamp())
+        except Exception:
+            start_unix = 0
+
         timeshift_url = custom_template.format(
             server_url=m3u_account.server_url.rstrip('/'),
             username=m3u_account.username,
             password=m3u_account.password,
             stream_id=stream_id_value,
             timestamp=local_timestamp,
-            duration=duration_minutes
+            duration=duration_minutes,
+            start_unix=start_unix,
+            epg_channel_id=props.get('epg_channel_id', ''),
+            channel_name=channel.name,
+            channel_id=channel.id,
+            tv_archive_duration=props.get('tv_archive_duration', 7),
+            extension=props.get('container_extension', 'ts'),
         )
         if debug:
             logger.info(f"[Timeshift] Using custom template")

@@ -57,7 +57,7 @@ class Plugin:
 
     def __init__(self):
         self.name = "Dispatcharr Timeshift"
-        self.version = "1.1.9"
+        self.version = "1.2.0"
         self.description = "Timeshift/catch-up TV support for Xtream Codes providers"
         self.url = "https://github.com/cedric-marcoux/dispatcharr_timeshift"
         self.author = "Cedric Marcoux"
@@ -260,7 +260,14 @@ class Plugin:
                 "type": "string",
                 "label": "Custom URL Template",
                 "default": "",
-                "help_text": "Only used when 'Custom template' is selected. Placeholders: {server_url}, {username}, {password}, {stream_id}, {timestamp}, {duration}"
+                "help_text": (
+                    "Only used when 'Custom template' is selected. "
+                    "Example: {server_url}/streaming/timeshift.php?username={username}&password={password}"
+                    "&stream={stream_id}&start={timestamp}&duration={duration} — "
+                    "Placeholders: {server_url} {username} {password} {stream_id} {timestamp} (local time YYYY-MM-DD:HH-MM) "
+                    "{duration} (minutes from EPG) {start_unix} (Unix epoch) "
+                    "{epg_channel_id} {channel_name} {channel_id} {tv_archive_duration} (days) {extension} (ts/m3u8)"
+                )
             }
         ]
 
@@ -275,22 +282,43 @@ class Plugin:
         - action="enable": Plugin is being enabled
         - action="disable": Plugin is being disabled
         """
+        global _hooks_installed
         context = context or {}
 
         if action == "enable":
             logger.info("[Timeshift] Enabling plugin...")
             from .hooks import install_hooks
             if install_hooks():
+                _hooks_installed = True
                 return {"status": "ok", "message": "Timeshift plugin enabled"}
             return {"status": "error", "message": "Failed to install hooks"}
 
         elif action == "disable":
-            # Note: Dispatcharr only toggles the 'enabled' flag in DB, it doesn't call this.
-            # Hooks remain installed and check enabled state at runtime.
-            logger.info("[Timeshift] Plugin disabled (hooks check enabled state at runtime)")
+            logger.info("[Timeshift] Disabling plugin...")
+            from .hooks import uninstall_hooks
+            uninstall_hooks()
+            _hooks_installed = False
             return {"status": "ok", "message": "Timeshift plugin disabled"}
 
         return {"status": "error", "message": f"Unknown action: {action}"}
+
+    def stop(self, context=None):
+        """
+        Graceful shutdown - called by Dispatcharr v0.19+ on disable/reload/delete.
+
+        Args:
+            context (dict, optional): Contains 'settings', 'logger', 'reason', 'actions'
+        """
+        global _hooks_installed
+        reason = context.get("reason", "unknown") if context else "unknown"
+        logger.info(f"[Timeshift] Stopping plugin (reason: {reason})...")
+
+        from .hooks import uninstall_hooks
+        if uninstall_hooks():
+            _hooks_installed = False
+            logger.info(f"[Timeshift] Plugin stopped successfully (reason: {reason})")
+            return {"status": "ok", "message": f"Timeshift stopped (reason: {reason})"}
+        return {"status": "error", "message": "Failed to uninstall hooks"}
 
 
 # Auto-install hooks when this module is imported (on Django startup)

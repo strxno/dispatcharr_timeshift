@@ -142,6 +142,75 @@ def install_hooks():
         return False
 
 
+def uninstall_hooks():
+    """
+    Restore all original functions for graceful shutdown.
+
+    Called by Plugin.stop() when Dispatcharr v0.19+ disables, reloads, or
+    deletes the plugin. Reverses all monkey-patches applied by install_hooks().
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    global _original_xc_get_live_streams, _original_stream_xc
+    global _original_xc_get_epg, _original_generate_epg
+    global _original_url_callbacks, _original_resolve
+
+    logger.info("[Timeshift] Uninstalling hooks...")
+
+    try:
+        # 1. Restore xc_get_live_streams
+        if _original_xc_get_live_streams:
+            from apps.output import views as output_views
+            output_views.xc_get_live_streams = _original_xc_get_live_streams
+            _original_xc_get_live_streams = None
+            logger.info("[Timeshift] Restored xc_get_live_streams")
+
+        # 2. Restore stream_xc module function + URL pattern callbacks
+        if _original_stream_xc:
+            from apps.proxy import views as proxy_views
+            proxy_views.stream_xc = _original_stream_xc
+            # Restore URL pattern callbacks (Django stores references at import time)
+            try:
+                import dispatcharr.urls as main_urls
+                for pattern in main_urls.urlpatterns:
+                    if id(pattern) in _original_url_callbacks:
+                        pattern.callback = _original_url_callbacks[id(pattern)]
+                _original_url_callbacks.clear()
+            except Exception as e:
+                logger.warning(f"[Timeshift] Could not restore URL callbacks: {e}")
+            _original_stream_xc = None
+            logger.info("[Timeshift] Restored stream_xc")
+
+        # 3. Restore xc_get_epg
+        if _original_xc_get_epg:
+            from apps.output import views as output_views
+            output_views.xc_get_epg = _original_xc_get_epg
+            _original_xc_get_epg = None
+            logger.info("[Timeshift] Restored xc_get_epg")
+
+        # 4. Restore generate_epg
+        if _original_generate_epg:
+            from apps.output import views as output_views
+            output_views.generate_epg = _original_generate_epg
+            _original_generate_epg = None
+            logger.info("[Timeshift] Restored generate_epg")
+
+        # 5. Restore URLResolver.resolve
+        if _original_resolve:
+            from django.urls.resolvers import URLResolver
+            URLResolver.resolve = _original_resolve
+            _original_resolve = None
+            logger.info("[Timeshift] Restored URLResolver.resolve")
+
+        logger.info("[Timeshift] All hooks uninstalled successfully")
+        return True
+
+    except Exception as e:
+        logger.error(f"[Timeshift] Failed to uninstall hooks: {e}", exc_info=True)
+        return False
+
+
 def _patch_xc_get_live_streams():
     """
     Patch xc_get_live_streams to:

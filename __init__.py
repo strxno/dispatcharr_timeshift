@@ -9,4 +9,4 @@ Note: Auto-install logic is in plugin.py (which Dispatcharr imports directly).
 from .plugin import Plugin
 
 __all__ = ['Plugin']
-__version__ = '1.1.8'
+__version__ = '1.2.0'
