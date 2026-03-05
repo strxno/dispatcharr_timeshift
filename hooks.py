@@ -6,8 +6,7 @@ Implements timeshift via monkey-patching (no modification to Dispatcharr source)
 2. Patches stream_xc to find channels by provider stream_id (for live streaming)
 3. Patches xc_get_epg to find channels by provider stream_id (for EPG/timeshift data)
 4. Patches generate_epg to convert XMLTV timestamps to local timezone (IPTVX fix)
-5. Patches xc_get_info to report configured timezone instead of container OS timezone
-6. Patches URLResolver.resolve to intercept /timeshift/ URLs
+5. Patches URLResolver.resolve to intercept /timeshift/ URLs
 
 RUNTIME ENABLE/DISABLE:
     Hooks are installed once at startup (regardless of plugin enabled state).
@@ -60,7 +59,6 @@ _original_xc_get_live_streams = None
 _original_stream_xc = None
 _original_xc_get_epg = None
 _original_generate_epg = None
-_original_xc_get_info = None
 _original_url_callbacks = {}
 _original_resolve = None
 
@@ -136,7 +134,6 @@ def install_hooks():
         _patch_stream_xc()
         _patch_xc_get_epg()
         _patch_generate_epg()
-        _patch_xc_get_info()
         _patch_url_resolver()
         logger.info("[Timeshift] All hooks installed successfully")
         return True
@@ -157,7 +154,6 @@ def uninstall_hooks():
     """
     global _original_xc_get_live_streams, _original_stream_xc
     global _original_xc_get_epg, _original_generate_epg
-    global _original_xc_get_info
     global _original_url_callbacks, _original_resolve
 
     logger.info("[Timeshift] Uninstalling hooks...")
@@ -200,14 +196,7 @@ def uninstall_hooks():
             _original_generate_epg = None
             logger.info("[Timeshift] Restored generate_epg")
 
-        # 5. Restore xc_get_info
-        if _original_xc_get_info:
-            from apps.output import views as output_views
-            output_views.xc_get_info = _original_xc_get_info
-            _original_xc_get_info = None
-            logger.info("[Timeshift] Restored xc_get_info")
-
-        # 6. Restore URLResolver.resolve
+        # 5. Restore URLResolver.resolve
         if _original_resolve:
             from django.urls.resolvers import URLResolver
             URLResolver.resolve = _original_resolve
@@ -616,19 +605,16 @@ def _patch_xc_get_epg():
                 # CUSTOM EPG RESPONSE: Include past programs for timeshift
                 from datetime import timedelta
                 from django.utils import timezone as django_timezone
-                from zoneinfo import ZoneInfo
                 import base64
 
                 # Get plugin config
-                timezone_str = config['timezone']
                 language = config['language']
-                local_tz = ZoneInfo(timezone_str)
 
                 archive_duration_days = int(props.get('tv_archive_duration', 7))
                 start_date = django_timezone.now() - timedelta(days=archive_duration_days)
 
                 if debug:
-                    logger.info(f"[Timeshift] EPG: Generating custom EPG for {channel.name}, archive={archive_duration_days}d, tz={timezone_str}")
+                    logger.info(f"[Timeshift] EPG: Generating custom EPG for {channel.name}, archive={archive_duration_days}d")
 
                 # Get programs from the last X days until future
                 programs = channel.epg_data.programs.filter(
@@ -645,9 +631,11 @@ def _patch_xc_get_epg():
                     title = program.title or ""
                     description = program.description or ""
 
-                    # Convert timestamps to local timezone
-                    start_local = start.astimezone(local_tz)
-                    end_local = end.astimezone(local_tz)
+                    # Keep timestamps in UTC (same as native Dispatcharr xc_get_epg)
+                    # WHY: TiviMate and other XC clients are calibrated for native behavior
+                    # (UTC timestamps + server_info.timezone="UTC"). Converting to CET here
+                    # caused offset issues because clients misinterpreted the timezone change.
+                    # The XMLTV patch (generate_epg) handles timezone for XMLTV clients separately.
 
                     # Generate unique ID for each program using timestamp
                     program_id = int(start.timestamp())
@@ -657,8 +645,8 @@ def _patch_xc_get_epg():
                         "epg_id": str(program.id) if hasattr(program, 'id') and program.id else str(program_id),
                         "title": base64.b64encode(title.encode()).decode(),
                         "lang": language,  # From plugin settings
-                        "start": start_local.strftime("%Y-%m-%d %H:%M:%S"),  # Local time
-                        "end": end_local.strftime("%Y-%m-%d %H:%M:%S"),      # Local time
+                        "start": start.strftime("%Y-%m-%d %H:%M:%S"),  # UTC (native behavior)
+                        "end": end.strftime("%Y-%m-%d %H:%M:%S"),      # UTC (native behavior)
                         "description": base64.b64encode(description.encode()).decode(),
                         "channel_id": str(props.get('epg_channel_id') or channel.id),  # STRING
                         "start_timestamp": str(int(start.timestamp())),  # STRING not int
@@ -682,10 +670,7 @@ def _patch_xc_get_epg():
 
                 return output
             else:
-                # No timeshift or short=True - delegate to original but convert timestamps
-                # WHY: Native xc_get_epg returns UTC timestamps without timezone indicator.
-                # XC clients (TiviMate, etc.) need timestamps in the server's local timezone.
-                # Related: Dispatcharr issues #651, #797, #383
+                # No timeshift or short=True - delegate to original (keeps UTC, native behavior)
                 if debug:
                     logger.info(f"[Timeshift] EPG: Delegating to original (tv_archive={has_tv_archive}, short={short})")
 
@@ -699,29 +684,6 @@ def _patch_xc_get_epg():
 
                 try:
                     result = _original_xc_get_epg(request, user, short)
-
-                    # Convert timestamps from UTC to local timezone
-                    # Same conversion as the tv_archive path (line 638-639)
-                    if isinstance(result, dict) and 'epg_listings' in result:
-                        from datetime import datetime
-                        from zoneinfo import ZoneInfo
-                        timezone_str = config['timezone']
-                        local_tz = ZoneInfo(timezone_str)
-                        utc = ZoneInfo("UTC")
-                        converted = 0
-                        for listing in result['epg_listings']:
-                            for field in ('start', 'end'):
-                                if field in listing and listing[field]:
-                                    try:
-                                        dt = datetime.strptime(listing[field], "%Y-%m-%d %H:%M:%S")
-                                        dt = dt.replace(tzinfo=utc)
-                                        listing[field] = dt.astimezone(local_tz).strftime("%Y-%m-%d %H:%M:%S")
-                                        converted += 1
-                                    except (ValueError, TypeError):
-                                        pass
-                        if debug:
-                            logger.info(f"[Timeshift] EPG: Converted {converted} timestamps to {timezone_str}")
-
                     return result
                 finally:
                     request.GET = original_get
@@ -831,55 +793,6 @@ def _patch_generate_epg():
 
     output_views.generate_epg = patched_generate_epg
     logger.info("[Timeshift] Patched generate_epg for XMLTV timezone conversion")
-
-
-def _patch_xc_get_info():
-    """
-    Patch xc_get_info to report the configured timezone instead of container OS timezone.
-
-    WHY THIS PATCH?
-        Dispatcharr runs in a UTC container. xc_get_info uses get_localzone().key
-        which returns "Etc/UTC". XC clients (TiviMate, etc.) use server_info.timezone
-        to interpret EPG timestamps. If server says UTC but user is in CET, the client
-        may display wrong times.
-
-        This patch overrides server_info.timezone with the plugin's configured timezone
-        and adjusts time_now to match.
-
-    Related issues: #651, #797, #383
-    """
-    global _original_xc_get_info
-
-    from apps.output import views as output_views
-
-    _original_xc_get_info = output_views.xc_get_info
-
-    def patched_xc_get_info(request, full=False):
-        # If plugin is disabled, use original function
-        if not _is_plugin_enabled():
-            return _original_xc_get_info(request, full)
-
-        result = _original_xc_get_info(request, full)
-
-        # Override timezone and time_now with configured values
-        try:
-            from datetime import datetime
-            from zoneinfo import ZoneInfo
-
-            config = _get_plugin_config()
-            timezone_str = config['timezone']
-            local_tz = ZoneInfo(timezone_str)
-
-            if isinstance(result, dict) and 'server_info' in result:
-                result['server_info']['timezone'] = timezone_str
-                result['server_info']['time_now'] = datetime.now(local_tz).strftime("%Y-%m-%d %H:%M:%S")
-        except Exception as e:
-            logger.warning(f"[Timeshift] xc_get_info timezone patch failed: {e}")
-
-        return result
-
-    output_views.xc_get_info = patched_xc_get_info
-    logger.info("[Timeshift] Patched xc_get_info for timezone correction")
 
 
 def _patch_url_resolver():
