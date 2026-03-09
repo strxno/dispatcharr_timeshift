@@ -463,7 +463,12 @@ def _convert_timestamp_to_local(timestamp, timezone_str):
     try:
         # Parse: YYYY-MM-DD:HH-MM
         utc_time = datetime.strptime(timestamp, "%Y-%m-%d:%H-%M")
-        utc_time = utc_time.replace(tzinfo=ZoneInfo("UTC"))
+        # Use datetime.timezone.utc instead of ZoneInfo("UTC") because
+        # ZoneInfo("UTC") can return wrong offset when /etc/timezone differs
+        # from /etc/localtime (common in Docker containers).
+        # See: Python reads /etc/timezone → CET, corrupting ZoneInfo("UTC").
+        from datetime import timezone as dt_timezone
+        utc_time = utc_time.replace(tzinfo=dt_timezone.utc)
 
         # Convert to target timezone
         local_time = utc_time.astimezone(ZoneInfo(timezone_str))

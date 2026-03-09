@@ -228,6 +228,17 @@ def _patch_xc_get_live_streams():
 
     from apps.output import views as output_views
 
+    # Guard: check function marker to detect already-patched state.
+    # Global check alone is insufficient because uninstall_hooks() resets globals,
+    # and Dispatcharr may call install_hooks() multiple times per worker
+    # (auto-install + enable action), corrupting _original references.
+    if getattr(output_views.xc_get_live_streams, '_is_timeshift_patch', False):
+        # Recover native func reference for this worker (inherited via fork)
+        if _original_xc_get_live_streams is None:
+            _original_xc_get_live_streams = output_views.xc_get_live_streams._native_func
+        logger.info("[Timeshift] xc_get_live_streams already patched, skipping")
+        return
+
     _original_xc_get_live_streams = output_views.xc_get_live_streams
 
     def patched_xc_get_live_streams(request, user, category_id=None):
@@ -310,6 +321,8 @@ def _patch_xc_get_live_streams():
 
         return streams
 
+    patched_xc_get_live_streams._is_timeshift_patch = True
+    patched_xc_get_live_streams._native_func = _original_xc_get_live_streams
     output_views.xc_get_live_streams = patched_xc_get_live_streams
     logger.info("[Timeshift] Patched xc_get_live_streams")
 
@@ -337,6 +350,12 @@ def _patch_stream_xc():
 
     from apps.proxy.ts_proxy import views as proxy_views
     from dispatcharr import urls as main_urls
+
+    if getattr(proxy_views.stream_xc, '_is_timeshift_patch', False):
+        if _original_stream_xc is None:
+            _original_stream_xc = proxy_views.stream_xc._native_func
+        logger.info("[Timeshift] stream_xc already patched, skipping")
+        return
 
     _original_stream_xc = proxy_views.stream_xc
 
@@ -468,6 +487,8 @@ def _patch_stream_xc():
         return stream_ts(actual_request, str(channel.uuid))
 
     # Patch the module (for any new imports)
+    patched_stream_xc._is_timeshift_patch = True
+    patched_stream_xc._native_func = _original_stream_xc
     proxy_views.stream_xc = patched_stream_xc
 
     # CRITICAL: Also patch the URL patterns callbacks
@@ -507,6 +528,12 @@ def _patch_xc_get_epg():
     global _original_xc_get_epg
 
     from apps.output import views as output_views
+
+    if getattr(output_views.xc_get_epg, '_is_timeshift_patch', False):
+        if _original_xc_get_epg is None:
+            _original_xc_get_epg = output_views.xc_get_epg._native_func
+        logger.info("[Timeshift] xc_get_epg already patched, skipping")
+        return
 
     _original_xc_get_epg = output_views.xc_get_epg
 
@@ -605,16 +632,19 @@ def _patch_xc_get_epg():
                 # CUSTOM EPG RESPONSE: Include past programs for timeshift
                 from datetime import timedelta
                 from django.utils import timezone as django_timezone
+                from zoneinfo import ZoneInfo
                 import base64
 
                 # Get plugin config
+                timezone_str = config['timezone']
                 language = config['language']
+                local_tz = ZoneInfo(timezone_str)
 
                 archive_duration_days = int(props.get('tv_archive_duration', 7))
                 start_date = django_timezone.now() - timedelta(days=archive_duration_days)
 
                 if debug:
-                    logger.info(f"[Timeshift] EPG: Generating custom EPG for {channel.name}, archive={archive_duration_days}d")
+                    logger.info(f"[Timeshift] EPG: Generating custom EPG for {channel.name}, archive={archive_duration_days}d, tz={timezone_str}")
 
                 # Get programs from the last X days until future
                 programs = channel.epg_data.programs.filter(
@@ -631,11 +661,13 @@ def _patch_xc_get_epg():
                     title = program.title or ""
                     description = program.description or ""
 
-                    # Keep timestamps in UTC (same as native Dispatcharr xc_get_epg)
-                    # WHY: TiviMate and other XC clients are calibrated for native behavior
-                    # (UTC timestamps + server_info.timezone="UTC"). Converting to CET here
-                    # caused offset issues because clients misinterpreted the timezone change.
-                    # The XMLTV patch (generate_epg) handles timezone for XMLTV clients separately.
+                    # Convert timestamps to local timezone for XC API clients
+                    # WHY: TiviMate displays start/end strings verbatim without
+                    # timezone conversion. Container runs in UTC, so we convert here.
+                    # DO NOT also patch xc_get_info timezone - that causes double conversion.
+                    # Verified: matches v0.17 behavior that worked correctly.
+                    start_local = start.astimezone(local_tz)
+                    end_local = end.astimezone(local_tz)
 
                     # Generate unique ID for each program using timestamp
                     program_id = int(start.timestamp())
@@ -645,12 +677,12 @@ def _patch_xc_get_epg():
                         "epg_id": str(program.id) if hasattr(program, 'id') and program.id else str(program_id),
                         "title": base64.b64encode(title.encode()).decode(),
                         "lang": language,  # From plugin settings
-                        "start": start.strftime("%Y-%m-%d %H:%M:%S"),  # UTC (native behavior)
-                        "end": end.strftime("%Y-%m-%d %H:%M:%S"),      # UTC (native behavior)
+                        "start": start_local.strftime("%Y-%m-%d %H:%M:%S"),  # Local time
+                        "end": end_local.strftime("%Y-%m-%d %H:%M:%S"),      # Local time
                         "description": base64.b64encode(description.encode()).decode(),
                         "channel_id": str(props.get('epg_channel_id') or channel.id),  # STRING
-                        "start_timestamp": str(int(start.timestamp())),  # STRING not int
-                        "stop_timestamp": str(int(end.timestamp())),     # STRING not int
+                        "start_timestamp": str(int(start.timestamp())),  # STRING not int (UTC epoch)
+                        "stop_timestamp": str(int(end.timestamp())),     # STRING not int (UTC epoch)
                         "stream_id": str(props.get('stream_id', channel.id)),  # Provider's stream_id
                         "now_playing": 0 if start > now or end < now else 1,
                         "has_archive": 0,  # INTEGER not string - default
@@ -670,7 +702,9 @@ def _patch_xc_get_epg():
 
                 return output
             else:
-                # No timeshift or short=True - delegate to original (keeps UTC, native behavior)
+                # No timeshift or short=True - delegate to original
+                # Matches v0.17 behavior: only tv_archive path converts timestamps.
+                # Short EPG and non-archive channels use native UTC output.
                 if debug:
                     logger.info(f"[Timeshift] EPG: Delegating to original (tv_archive={has_tv_archive}, short={short})")
 
@@ -683,8 +717,7 @@ def _patch_xc_get_epg():
                 request.GET = new_get
 
                 try:
-                    result = _original_xc_get_epg(request, user, short)
-                    return result
+                    return _original_xc_get_epg(request, user, short)
                 finally:
                     request.GET = original_get
 
@@ -694,6 +727,8 @@ def _patch_xc_get_epg():
             logger.error(f"[Timeshift] EPG: Unexpected error for stream_id={channel_id}: {e}", exc_info=True)
             raise Http404()
 
+    patched_xc_get_epg._is_timeshift_patch = True
+    patched_xc_get_epg._native_func = _original_xc_get_epg
     output_views.xc_get_epg = patched_xc_get_epg
     logger.info("[Timeshift] Patched xc_get_epg for provider stream_id lookup")
 
@@ -713,6 +748,12 @@ def _patch_generate_epg():
     global _original_generate_epg
 
     from apps.output import views as output_views
+
+    if getattr(output_views.generate_epg, '_is_timeshift_patch', False):
+        if _original_generate_epg is None:
+            _original_generate_epg = output_views.generate_epg._native_func
+        logger.info("[Timeshift] generate_epg already patched, skipping")
+        return
 
     _original_generate_epg = output_views.generate_epg
 
@@ -766,7 +807,11 @@ def _patch_generate_epg():
                             timestamp_str = match.group(1)
                             try:
                                 utc_time = datetime.strptime(timestamp_str, "%Y%m%d%H%M%S")
-                                utc_time = utc_time.replace(tzinfo=ZoneInfo("UTC"))
+                                # Use datetime.timezone.utc instead of ZoneInfo("UTC")
+                                # because ZoneInfo("UTC") returns wrong offset when
+                                # /etc/timezone conflicts with /etc/localtime (Docker).
+                                from datetime import timezone as dt_timezone
+                                utc_time = utc_time.replace(tzinfo=dt_timezone.utc)
                                 local_time = utc_time.astimezone(local_tz)
                                 return local_time.strftime("%Y%m%d%H%M%S %z")
                             except Exception as e:
@@ -791,6 +836,8 @@ def _patch_generate_epg():
             logger.error(f"[Timeshift] XMLTV: Generation error, falling back to original: {e}")
             return _original_generate_epg(request, profile_name, user)
 
+    patched_generate_epg._is_timeshift_patch = True
+    patched_generate_epg._native_func = _original_generate_epg
     output_views.generate_epg = patched_generate_epg
     logger.info("[Timeshift] Patched generate_epg for XMLTV timezone conversion")
 

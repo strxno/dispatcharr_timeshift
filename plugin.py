@@ -17,7 +17,9 @@ AUTO-INSTALL ON STARTUP:
     in EACH worker independently.
 """
 
+import json
 import logging
+import os
 
 logger = logging.getLogger("plugins.dispatcharr_timeshift")
 
@@ -47,6 +49,23 @@ def _auto_install_hooks():
         logger.error(f"[Timeshift] Auto-install error: {e}")
 
 
+def _read_plugin_version():
+    """
+    Read version from plugin.json (single source of truth).
+
+    WHY plugin.json?
+        plugin.py self.version was often forgotten during releases,
+        causing mismatches. plugin.json is always updated by the
+        release process, so it's the authoritative version source.
+    """
+    try:
+        manifest_path = os.path.join(os.path.dirname(__file__), "plugin.json")
+        with open(manifest_path, "r") as f:
+            return json.load(f).get("version", "0.0.0")
+    except Exception:
+        return "0.0.0"
+
+
 class Plugin:
     """
     Main plugin class for Dispatcharr Timeshift.
@@ -55,15 +74,18 @@ class Plugin:
     when the plugin is toggled in the UI.
     """
 
+    GITHUB_REPO = "cedric-marcoux/dispatcharr_timeshift"
+
     def __init__(self):
         self.name = "Dispatcharr Timeshift"
-        self.version = "1.2.2"
+        self.version = _read_plugin_version()
         self.description = "Timeshift/catch-up TV support for Xtream Codes providers"
         self.url = "https://github.com/cedric-marcoux/dispatcharr_timeshift"
         self.author = "Cedric Marcoux"
         self.author_url = "https://github.com/cedric-marcoux"
 
-        self.fields = [
+        # Settings fields (version info is prepended dynamically via @property)
+        self._settings_fields = [
             {
                 "id": "timezone",
                 "type": "select",
@@ -273,6 +295,54 @@ class Plugin:
 
         # No custom actions needed
         self.actions = []
+
+    @property
+    def fields(self):
+        """
+        Dynamic fields: version check info + settings fields.
+
+        WHY @property?
+            The version check is lazy: only triggered when the settings page
+            loads (PluginManager reads plugin.instance.fields). The result is
+            cached 24h in memory, so subsequent loads are instant.
+            Zero changes needed in Dispatcharr core.
+        """
+        version_field = self._build_version_field()
+        return [version_field] + self._settings_fields
+
+    def _build_version_field(self):
+        """Build the info field showing version status with GitHub link."""
+        try:
+            from .version_check import check_for_update
+            result = check_for_update(self.GITHUB_REPO, self.version)
+        except Exception:
+            result = {"error": "Version check module unavailable", "current": self.version}
+
+        if result.get("error"):
+            return {
+                "id": "version_info",
+                "type": "info",
+                "label": f"Version {result['current']}",
+                "help_text": f"Unable to check for updates: {result['error']}",
+            }
+        elif result.get("has_update"):
+            return {
+                "id": "version_info",
+                "type": "info",
+                "label": f"Update available: v{result['latest']}",
+                "help_text": (
+                    f"You are running v{result['current']}. "
+                    f"Version {result['latest']} is available. "
+                    f"Download: {result['release_url']}"
+                ),
+            }
+        else:
+            return {
+                "id": "version_info",
+                "type": "info",
+                "label": f"Version {result['current']} (latest)",
+                "help_text": f"You are running the latest version. Last checked: {result.get('checked_at', 'N/A')}",
+            }
 
     def run(self, action=None, params=None, context=None):
         """
