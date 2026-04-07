@@ -211,6 +211,24 @@ def uninstall_hooks():
         return False
 
 
+def _xc_direct_source_for_stream(stream):
+    if not stream or not stream.m3u_account:
+        return ""
+    try:
+        from apps.proxy.ts_proxy.url_utils import transform_url
+        profiles = list(stream.m3u_account.profiles.filter(is_active=True))
+        default_profile = next((p for p in profiles if p.is_default), None)
+        if not default_profile:
+            return ""
+        return transform_url(
+            stream.url,
+            default_profile.search_pattern,
+            default_profile.replace_pattern,
+        ) or ""
+    except Exception:
+        return ""
+
+
 def _patch_xc_get_live_streams():
     """
     Patch xc_get_live_streams to:
@@ -288,14 +306,18 @@ def _patch_xc_get_live_streams():
                         if debug:
                             logger.info(f"[Timeshift] API:   {stream.name}: tv_archive=0")
 
-                # Get first stream for provider_stream_id (API response needs it)
                 first_stream = channel.streams.order_by('channelstream__order').first()
                 if not first_stream:
                     if debug:
                         logger.info(f"[Timeshift] API: No streams for channel '{channel.name}' (id={original_stream_id})")
                     continue
 
-                props = first_stream.custom_properties or {}
+                if tv_archive and catchup_stream:
+                    source_stream = catchup_stream
+                else:
+                    source_stream = first_stream
+
+                props = source_stream.custom_properties or {}
 
                 # Add tv_archive values (based on ANY stream with catch-up)
                 stream_data['tv_archive'] = tv_archive
@@ -306,12 +328,16 @@ def _patch_xc_get_live_streams():
                     if debug:
                         logger.info(f"[Timeshift] API: {channel.name} → tv_archive=1 (from {catchup_stream.name if catchup_stream else 'unknown'}), duration={stream_data['tv_archive_duration']}d")
 
-                # Replace stream_id with provider's stream_id (use first stream for consistency)
                 provider_stream_id = props.get('stream_id')
                 if provider_stream_id:
                     if debug:
                         logger.info(f"[Timeshift] API: {channel.name} → stream_id {original_stream_id} → {provider_stream_id}")
                     stream_data['stream_id'] = int(provider_stream_id)
+
+                if channel.get_stream_profile().is_redirect() and tv_archive and catchup_stream:
+                    ds = _xc_direct_source_for_stream(catchup_stream)
+                    if ds:
+                        stream_data['direct_source'] = ds
 
             except Exception as e:
                 logger.error(f"[Timeshift] API: Error enhancing stream internal_id={original_stream_id}: {e}")
@@ -480,11 +506,9 @@ def _patch_stream_xc():
                 logger.info(f"[Timeshift] Live: Access denied - user_level {user.user_level} < required {channel.user_level}")
             return JsonResponse({"error": "Not found"}, status=404)
 
-        # Call the original stream_ts function
         from apps.proxy.ts_proxy.views import stream_ts
-        # Handle both DRF requests and regular Django requests
         actual_request = getattr(request, '_request', request)
-        return stream_ts(actual_request, str(channel.uuid))
+        return stream_ts(actual_request, str(channel.uuid), user)
 
     # Patch the module (for any new imports)
     patched_stream_xc._is_timeshift_patch = True
@@ -865,9 +889,10 @@ def _patch_url_resolver():
 
     from django.urls.resolvers import URLResolver
 
-    # Already patched if _original_resolve is set
-    if _original_resolve is not None:
-        logger.info("[Timeshift] URLResolver already patched")
+    if getattr(URLResolver.resolve, '_is_timeshift_patch', False):
+        if _original_resolve is None:
+            _original_resolve = URLResolver.resolve._native_func
+        logger.info("[Timeshift] URLResolver already patched, skipping")
         return
 
     from .views import timeshift_proxy
@@ -896,5 +921,7 @@ def _patch_url_resolver():
                 )
         return _original_resolve(self, path)
 
+    patched_resolve._is_timeshift_patch = True
+    patched_resolve._native_func = _original_resolve
     URLResolver.resolve = patched_resolve
     logger.info("[Timeshift] Patched URLResolver.resolve")

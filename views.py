@@ -161,6 +161,8 @@ def timeshift_proxy(request, username, password, stream_id, timestamp, duration)
     if not channel:
         raise Http404("Channel not found")
 
+    stream = _resolve_stream_for_timeshift(channel, stream)
+
     if debug:
         logger.info(f"[Timeshift] Channel found: {channel.name} (id={channel.id})")
 
@@ -321,6 +323,19 @@ def _find_channel_by_provider_stream_id(provider_stream_id):
         logger.error(f"[Timeshift] Channel not found: provider_stream_id={provider_stream_id}")
 
     return None, None
+
+
+def _resolve_stream_for_timeshift(channel, stream):
+    if not stream:
+        return None
+    props = stream.custom_properties or {}
+    if int(props.get('tv_archive', 0)):
+        return stream
+    for s in channel.streams.order_by('channelstream__order'):
+        p = s.custom_properties or {}
+        if int(p.get('tv_archive', 0)):
+            return s
+    return stream
 
 
 def _proxy_stream(request, url, user_agent, fallback_url=None, m3u_account_id=None, debug=False):
