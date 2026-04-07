@@ -17,4 +17,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Redirect stream profile** — For channels using Dispatcharr’s **Redirect** profile, `player_api.php` now sets **`direct_source`** to the provider URL derived from the **same catch-up stream** used for `stream_id` (M3U default profile + `transform_url`), so direct play and catch-up metadata stay aligned. Proxy profile behavior is unchanged (`direct_source` remains empty).
 
-[1.2.6]: https://github.com/strxno/dispatcharr_timeshift/compare/v1.2.5...v1.2.6
+[1.2.6]: https://github.com/cedric-marcoux/dispatcharr_timeshift/compare/v1.2.5...v1.2.6
