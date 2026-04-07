@@ -161,15 +161,8 @@ def timeshift_proxy(request, username, password, stream_id, timestamp, duration)
     if not channel:
         raise Http404("Channel not found")
 
-    stream = _resolve_stream_for_timeshift(channel, stream)
-
     if debug:
         logger.info(f"[Timeshift] Channel found: {channel.name} (id={channel.id})")
-        if stream:
-            logger.info(
-                f"[Timeshift] Stream for timeshift: {stream.name} "
-                f"(tv_archive={(stream.custom_properties or {}).get('tv_archive')})"
-            )
 
     # Step 3: Verify user has access to this channel
     if user.user_level < channel.user_level:
@@ -328,26 +321,6 @@ def _find_channel_by_provider_stream_id(provider_stream_id):
         logger.error(f"[Timeshift] Channel not found: provider_stream_id={provider_stream_id}")
 
     return None, None
-
-
-def _resolve_stream_for_timeshift(channel, stream):
-    """
-    Use the matched stream for timeshift if it has tv_archive; otherwise the first
-    channel stream (by priority order) that has catch-up enabled.
-
-    Handles legacy clients that still have the old API behavior (provider id from
-    first stream only) and keeps playback consistent with xc_get_live_streams.
-    """
-    if not stream:
-        return None
-    props = stream.custom_properties or {}
-    if int(props.get('tv_archive', 0)):
-        return stream
-    for s in channel.streams.order_by('channelstream__order'):
-        p = s.custom_properties or {}
-        if int(p.get('tv_archive', 0)):
-            return s
-    return stream
 
 
 def _proxy_stream(request, url, user_agent, fallback_url=None, m3u_account_id=None, debug=False):
